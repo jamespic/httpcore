@@ -4,7 +4,6 @@ import ssl
 import sys
 import types
 import typing
-
 from .._backends.sync import SyncBackend
 from .._backends.base import SOCKET_OPTION, NetworkBackend
 from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
@@ -278,6 +277,7 @@ class ConnectionPool(RequestInterface):
         those connections to be handled seperately.
         """
         closing_connections = []
+        idling_count = 0
 
         # First we handle cleaning up any connections that are closed,
         # have expired, or surplus idle connections.
@@ -289,24 +289,29 @@ class ConnectionPool(RequestInterface):
                 # log: "closing expired connection"
                 self._connections.remove(connection)
                 closing_connections.append(connection)
-            elif (
-                connection.is_idle()
-                and sum(connection.is_idle() for connection in self._connections)
-                > self._max_keepalive_connections
-            ):
+            elif connection.is_idle():
+                if idling_count < self._max_keepalive_connections:
+                    idling_count += 1
+                    continue
                 # log: "closing idle connection"
                 self._connections.remove(connection)
                 closing_connections.append(connection)
 
         # Assign queued requests to connections.
-        queued_requests = [request for request in self._requests if request.is_queued()]
-        for pool_request in queued_requests:
+        for pool_request in list(self._requests):
+            if not pool_request.is_queued():
+                continue
+
             origin = pool_request.request.url.origin
-            available_connections = [
-                connection
-                for connection in self._connections
-                if connection.can_handle_request(origin) and connection.is_available()
-            ]
+            available_connection = next(
+                (
+                    connection
+                    for connection in self._connections
+                    if connection.can_handle_request(origin)
+                    and connection.is_available()
+                ),
+                None,
+            )
 
             # There are three cases for how we may be able to handle the request:
             #
@@ -314,28 +319,26 @@ class ConnectionPool(RequestInterface):
             # 2. We can create a new connection to handle the request.
             # 3. We can close an idle/expired connection and then create a new connection
             #    to handle the request.
-            if available_connections:
+            if available_connection is not None:
                 # log: "reusing existing connection"
-                connection = available_connections[0]
-                pool_request.assign_to_connection(connection)
+                pool_request.assign_to_connection(available_connection)
             elif len(self._connections) < self._max_connections:
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
                 self._connections.append(connection)
                 pool_request.assign_to_connection(connection)
             else:
-                purged_connection = next(
-                    (c for c in self._connections if c.is_idle() or c.has_expired()),
-                    None,
+                idling_connection = next(
+                    (c for c in self._connections if c.is_idle()), None
                 )
-                if purged_connection is not None:
+                if idling_connection is not None:
                     # log: "closing idle connection"
-                    self._connections.remove(purged_connection)
-                    closing_connections.append(purged_connection)
+                    self._connections.remove(idling_connection)
+                    closing_connections.append(idling_connection)
                     # log: "creating new connection"
-                    connection = self.create_connection(origin)
-                    self._connections.append(connection)
-                    pool_request.assign_to_connection(connection)
+                    new_connection = self.create_connection(origin)
+                    self._connections.append(new_connection)
+                    pool_request.assign_to_connection(new_connection)
 
         return closing_connections
 
